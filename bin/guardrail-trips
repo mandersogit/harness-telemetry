@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# guardrail-trips — audit a Claude Code transcript for harness-initiated
+# mid-thread model changes, so a captured session can be trusted to be
+# single-model. This is a provenance check: it only
+# reads records Claude Code already wrote to your own transcript file.
+#
+# A capture's request/response pairing and cost accounting assume every
+# inference in a session came from the same model. When that assumption is
+# false — because Claude Code itself switched models mid-thread — it writes a
+# `system` record with subtype `model_refusal_fallback` recording the switch.
+# That record carries `refusedUserMessageUuid` (the message present at the
+# switch), `originalModel` / `fallbackModel`, `trigger`, `requestId`, and
+# `retractedMessageUuids`. This resolves the uuid so you see which message was
+# present when the switch happened, not just that one occurred.
+#
+# Usage:
+#   bin/guardrail-trips                 # scan this project's transcripts (newest first)
+#   bin/guardrail-trips <session-id>    # a specific session
+#   bin/guardrail-trips <path.jsonl>    # an explicit transcript file
+#   bin/guardrail-trips --all-projects  # every project under ~/.claude/projects
+set -euo pipefail
+
+command -v jq >/dev/null 2>&1 || { echo "guardrail-trips needs jq" >&2; exit 127; }
+
+PROJECTS="$HOME/.claude/projects"
+# The encoded dir for the CWD project (CC replaces / with -).
+proj_dir="$PROJECTS/$(pwd | sed 's#/#-#g')"
+
+arg="${1:-}"
+files=""
+case "$arg" in
+  --all-projects) files=$(find "$PROJECTS" -maxdepth 2 -name '*.jsonl' 2>/dev/null) ;;
+  "")             files=$(command ls -t "$proj_dir"/*.jsonl 2>/dev/null || true) ;;
+  *.jsonl)        files="$arg" ;;
+  *)              files=$(command ls "$proj_dir/$arg.jsonl" 2>/dev/null \
+                          || find "$PROJECTS" -maxdepth 2 -name "$arg.jsonl" 2>/dev/null || true) ;;
+esac
+[ -n "$files" ] || { echo "no transcript found for '${arg:-<this project>}' under $PROJECTS" >&2; exit 1; }
+
+# jq: for each model_refusal_fallback record, resolve the message present at the
+# switch by uuid and render a human-readable block. Slurps the file (uuid lookup
+# needs the whole set).
+prog='
+def txt: if type=="string" then . else
+  ([.[]? | if .type=="text" then .text
+           elif .type=="tool_use" then "[tool_use:\(.name)]"
+           elif .type=="tool_result" then "[tool_result]"
+           elif .type=="thinking" then "[thinking]"
+           else "[\(.type // "block")]" end] | join(" ")) end;
+(map(select(.uuid != null) | {key: .uuid, value: .}) | from_entries) as $by
+| [ .[] | select(.type=="system" and .subtype=="model_refusal_fallback") ] as $trips
+| if ($trips | length) == 0 then "  (no guardrail trips in this transcript)"
+  else $trips[]
+  | .refusedUserMessageUuid as $ruid
+  | ($by[$ruid].message.content // null) as $flagged
+  | "  ── trip @ \(.timestamp)  ────────────────────────────────",
+    "  switch     : \(.originalModel)  ->  \(.fallbackModel)   (trigger: \(.trigger), dir: \(.direction))",
+    "  requestId  : \(.requestId)",
+    "  category   : \(.apiRefusalCategory // "null")   explanation: \(.apiRefusalExplanation // "null")",
+    "  retracted  : \((.retractedMessageUuids // []) | length) message(s)",
+    "  notice     : \(.content)",
+    "  ── flagged message (\($by[$ruid].message.role // "?"), uuid \($ruid // "?")) ──",
+    (if $flagged == null then "  (not in this file — likely a prior assistant turn)"
+     else ($flagged | txt | "  " + (.[0:1200])) end),
+    ""
+  end'
+
+# One path per LINE, never `for f in $files`: word splitting breaks any
+# transcript path containing a space (Claude Code's project dirs are derived from
+# the working directory, which is the user's, not ours). bash 3.2: no readarray.
+printf '%s\n' "$files" | while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  n=$(jq -s '[.[] | select(.subtype=="model_refusal_fallback")] | length' "$f" 2>/dev/null || echo 0)
+  [ "${n:-0}" -gt 0 ] || { [ -n "$arg" ] && [ "$arg" != "--all-projects" ] || continue; }
+  printf '\n\033[1m%s\033[0m  (%s trip%s)\n' "$(basename "$f" .jsonl)" "${n:-0}" "$([ "${n:-0}" = 1 ] || echo s)"
+  jq -rs "$prog" "$f"
+done

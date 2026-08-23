@@ -1,0 +1,405 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mandersogit/harness-telemetry/main/schema/events.schema.json",
+  "title": "Normalized agent-session capture",
+  "description": "The normalized event vocabulary that harness-telemetry OWNS, designed as the contract for an unreleased companion project (session-fs) that consumes it. A session = metadata + a content-addressed object store (block-level) + an append-only, ordered event log + per-inference manifests. The atomic unit is the inference call. Content is addressed by hash; per-request annotations (cache_control) and correlation IDs are NOT part of the hashed content. Raw API bodies live in a separate audit ring, referenced by hash, never inlined here. Reconciled against real Claude Code captures.",
+  "type": "object",
+  "required": ["schema_version", "session", "objects", "events"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "enum": ["1.1", "1.2", "1.3", "1.4", "1.5"],
+      "description": "1.1 (2026-07-02) adds: tool_def + opaque object kinds, inference.prelude / lineage_id / response_block_refs / pairing, context_entry.message_index, message.uuids, correlation.server_request_id_kind, a genuinely open event-type set, and the documented event ordering. 1.2 (2026-07-02) adds: session.captures + raw_bodies.*.capture — one logical session stitched across several capture dirs (the resume lifecycle). 1.3 (2026-07-02) adds: the hook channel — event type 'hook' (verbatim Claude Code hook payloads recorded by the injected listener), source 'hook', captured_with.hooks. 1.4 (2026-07-02) adds: sub-agent transcript ingestion — message/harness_event carry agent_id (+ workflow_id under a workflow) when they came from <sid>/subagents/agent-*.jsonl; harness_event subtypes subagent_meta (the .meta.json verbatim; its toolUseId is the DAG splice point to the spawning Task tool_use), workflow_meta (<sid>/workflows/<wf>.json verbatim, incl. the workflow script), workflow_journal (one per journal.jsonl line). 1.5 (2026-07-02) adds: inference.instance_id — chain-component identity distinguishing parallel same-type agent instances (lineage_id stays the prelude kind)."
+    },
+    "session": { "$ref": "#/$defs/session" },
+    "objects": {
+      "description": "Content-addressed store, BLOCK-level. Key = sha256 of the object's canonical JSON (content only). Dedup is inherent: same content -> same key.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/sha" },
+      "additionalProperties": { "$ref": "#/$defs/object" }
+    },
+    "events": {
+      "description": "Append-only log, ordered by seq starting at 0. ORDERING (v1.1): a total order over the ingested channels — the emitter sorts by ts (ISO-8601 Zulu strings, compared lexically; an inference ts is backfilled from OTEL or, marked ts_source 'file-mtime', derived from the response-file mtime). An event with NO ts of its own inherits the nearest PRECEDING ts within its own channel (a leading ts-less event sorts first, with the empty string as its key). Ties break by channel rank (transcript, inference, OTEL, hook) and then by the event's original position within its channel — deterministic, and message-less calls land where they happened rather than at the end of the log. NOTE: otel_seq (the OTEL exporter's event.sequence) is NOT part of the ordering key; it is carried as reported provenance only. Open type set: new event types validate via the catch-all branch (bare seq/type/source shape), so consumers must tolerate unknown types.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "raw_bodies": {
+      "description": "OPTIONAL metadata index for the audit ring (the literal assembled request/response bodies, stored externally and compressed, NOT inlined here). Keyed by the sha of the raw body. The working store references these via inference.request_body_ref / response_body_ref.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/sha" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "enum": ["request", "response"] },
+          "server_request_id": { "type": ["string", "null"] },
+          "body_length": { "type": ["integer", "null"] },
+          "path": { "type": ["string", "null"], "pattern": "^bodies/[^/]+\\.(request|response)\\.json$", "description": "Where the raw body is materialized, RELATIVE to its capture dir: exactly `bodies/<name>.{request,response}.json`. Never absolute, never containing `..` — a consumer resolves it against a capture directory and reads it, so anything else is a path-traversal vector, and harness-validate --roundtrip refuses to open a path of any other shape." },
+          "capture": { "type": ["string", "null"], "description": "Which capture (id from session.captures) holds this body — resolves `path` when a doc spans several captures (v1.2)." }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "$defs": {
+    "sha": {
+      "type": "string",
+      "description": "A full lowercase sha256 hex digest — 64 characters, never truncated. Dedup correctness needs the whole digest, and consumers materialize the store as files named by the key, so a short or non-hex key is a safety problem as well as a collision one. (harness-project abbreviates refs inside its own projected tree; that is a rendering, not this contract.)",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "ts": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 UTC, or null when the source channel does not carry a timestamp."
+    },
+    "source": {
+      "enum": ["transcript", "otel_event", "otel_metric", "raw_body", "derived", "hook"],
+      "description": "Which capture channel this event/field came from. Lets consumers reason about fidelity and degrade gracefully when a channel is absent."
+    },
+    "otel_seq": {
+      "type": ["integer", "null"],
+      "description": "The OTEL exporter's monotonic event.sequence for the log record this event came from. Reported provenance only — present just when the OTEL channel was ingested, and NOT part of the log's ordering key (see events.description)."
+    },
+    "session": {
+      "type": "object",
+      "required": ["session_id", "harness", "captured_with"],
+      "additionalProperties": false,
+      "properties": {
+        "session_id": { "type": "string" },
+        "harness": { "type": "string", "examples": ["claude-code", "codex-cli", "pi"] },
+        "harness_version": { "type": ["string", "null"] },
+        "entrypoint": {
+          "type": ["string", "null"],
+          "description": "e.g. Claude Code 'cli' (interactive) vs 'sdk-cli' (headless -p), detectable from the system prompt."
+        },
+        "cwd": { "type": ["string", "null"] },
+        "account_uuid": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"], "description": "Primary model; per-inference model is authoritative." },
+        "captures": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Capture ids (dir basenames) that fed this doc, chronological. More than one = a multi-capture logical session: an original run plus its --resume continuations, all sharing session_id (v1.2)."
+        },
+        "captured_with": {
+          "type": "object",
+          "description": "Per-channel INGESTION flags: each is true when that channel actually yielded records for THIS doc, not merely when it was configured. transcript = at least one message event came from a transcript file; raw_bodies = at least one request body was parsed; otel_events = the sink's logs-*.json produced per-request records or zoo events; otel_metrics = at least one metrics-*.json was present; hooks = at least one hook record was ingested. Drives graceful degradation: inference events are built from raw bodies ALONE, so without that channel the doc carries no inferences (hence no context, usage or cost); cost_usd is derived from the response bodies' token counts (never from OTEL), while duration_ms and correlation.prompt_id need otel_events.",
+          "required": ["transcript", "raw_bodies", "otel_metrics", "otel_events"],
+          "additionalProperties": false,
+          "properties": {
+            "transcript": { "type": "boolean" },
+            "raw_bodies": { "type": "boolean" },
+            "otel_metrics": { "type": "boolean" },
+            "otel_events": { "type": "boolean" },
+            "hooks": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "object": {
+      "description": "One content block. Content ONLY — no cache_control, no per-request annotations, no correlation IDs (those live on the inference event).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "text"],
+          "additionalProperties": true,
+          "description": "Extras on a known kind (e.g. citations) are CONTENT and pass through (v1.1).",
+          "properties": { "kind": { "const": "text" }, "text": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "persisted"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "thinking" },
+            "persisted": {
+              "enum": ["none", "summary", "raw"],
+              "description": "Provenance of the reasoning, NOT fabricated content. Claude: 'none' (emptied + signature) or 'summary'. A non-Claude model whose reasoning Claude Code strips also normalizes to 'none'. 'raw' only when genuine reasoning text survived to capture."
+            },
+            "text": { "type": ["string", "null"], "description": "Reasoning text iff persisted == 'raw'." },
+            "summary": { "type": ["string", "null"], "description": "Summary text iff persisted == 'summary'." },
+            "signature": {
+              "type": ["string", "null"],
+              "description": "The block's opaque signature, kept as content-identity: it distinguishes one reasoning turn from another and lets the SAME turn's (emptied) thinking dedup across the many later inferences that replay it. Null when absent."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "id", "name", "input"],
+          "additionalProperties": true,
+          "properties": {
+            "kind": { "const": "tool_use" },
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "input": { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "tool_use_id"],
+          "additionalProperties": true,
+          "properties": {
+            "kind": { "const": "tool_result" },
+            "tool_use_id": { "type": "string" },
+            "content": { "description": "String or array of content blocks, as the harness emitted it." },
+            "is_error": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "description": "One tool definition from the request's tools[] (v1.1). Content-addressed like every object, so a lineage's stable tool-set dedups to one object per tool.",
+          "required": ["kind", "name"],
+          "additionalProperties": true,
+          "properties": {
+            "kind": { "const": "tool_def" },
+            "name": { "type": "string" },
+            "description": { "type": ["string", "null"] },
+            "input_schema": { "type": ["object", "null"] },
+            "type": { "type": ["string", "null"], "description": "Server-tool type tag (e.g. web_search_20250305), when present." }
+          }
+        },
+        {
+          "type": "object",
+          "description": "MARKED fallback for unrecognized block types (v1.1; e.g. image). Replaces the old silent text coercion: the loss of interpretation is visible, the raw block is preserved verbatim.",
+          "required": ["kind", "raw"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "opaque" },
+            "block_type": { "type": ["string", "null"] },
+            "raw": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "correlation": {
+      "type": "object",
+      "description": "Join keys across channels. request_id is server-assigned and NOT present in the request body (which carries only client metadata); hence a tuple, not a single key.",
+      "additionalProperties": false,
+      "properties": {
+        "client_request_uuid": { "type": ["string", "null"], "description": "Client-generated id (the request-body file name in OTEL file: capture)." },
+        "server_request_id": { "type": ["string", "null"], "description": "Anthropic 'req_...' id (on the response + the OTEL api_request event)." },
+        "server_request_id_kind": {
+          "enum": ["anthropic_request_id", "filename", null],
+          "description": "v1.1: what server_request_id actually is. Anthropic first-party names response files by the req_... id; other endpoints (OpenRouter) use a client-side UUID — joins must not treat those alike."
+        },
+        "message_id": { "type": ["string", "null"], "description": "v1.1: the response body's own id (msg_...). The NEXT request of the lineage echoes it as diagnostics.previous_message_id — a native chain discovered 2026-07-02." },
+        "previous_request_id": { "type": ["string", "null"], "description": "v1.1: cc_prev_req from the system[0] billing header (CC >= 2.1.198) — the previous call's req_... id. Stripped from the lineage hash (per-request correlation riding in system[]); the strongest pairing chain since req_ ids ARE response filenames. Discovered live 2026-07-02." },
+        "previous_message_id": { "type": ["string", "null"], "description": "v1.1: this request's diagnostics.previous_message_id — the msg_... id of the lineage's previous response. Correlation data that rides inside the request params (kept verbatim there for round-trip; excluded from the lineage hash)." },
+        "prompt_id": { "type": ["string", "null"], "description": "OTEL prompt.id grouping all events (incl. retries) from one user prompt." }
+      }
+    },
+    "context_entry": {
+      "type": "object",
+      "description": "One ordered slot in an inference's assembled context. Points at content by hash; per-request annotations (cache_control) live HERE, not in the object, so identical content dedups across inferences even as the cache breakpoint advances.",
+      "required": ["ref", "role"],
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/sha" },
+        "role": { "enum": ["system", "user", "assistant", "tool"] },
+        "message_index": {
+          "type": ["integer", "null"],
+          "description": "v1.1: which wire message this block belonged to (0-based over the request's messages[]; ABSENT for prelude system[] blocks — presence, not role, is the discriminator: CC appends dynamic system context as a role-system MESSAGE inside messages[]). Entries sharing a value regroup into one message — what makes reconstruct() exact."
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Per-request, content-independent annotations (e.g. cache_control). Deliberately excluded from the hashed object.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "description": "Token usage from the response/OTEL. Core four are first-class; harness-specific extras (service_tier, speed, server_tool_use, ...) pass through.",
+      "additionalProperties": true,
+      "properties": {
+        "input_tokens": { "type": ["integer", "null"] },
+        "output_tokens": { "type": ["integer", "null"] },
+        "cache_read_tokens": { "type": ["integer", "null"] },
+        "cache_creation_tokens": { "type": ["integer", "null"] }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["seq", "type", "source"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "type": "string" },
+        "ts": { "$ref": "#/$defs/ts" },
+        "source": { "$ref": "#/$defs/source" }
+      },
+      "oneOf": [
+        {
+          "title": "message",
+          "description": "A node in the conversation tree/DAG. Blocks reference objects. The 'what happened' layer (from the transcript).",
+          "required": ["type", "uuid", "role", "block_refs"],
+          "properties": {
+            "type": { "const": "message" },
+            "uuid": { "type": "string", "description": "Node id. For a regrouped multi-block assistant message this is the LAST underlying record's uuid (children parent off it — verified)." },
+            "uuids": { "type": "array", "items": { "type": "string" }, "description": "v1.1: all underlying per-block record uuids merged into this message, in record order." },
+            "parent_uuid": { "type": ["string", "null"], "description": "For a regrouped message: the FIRST underlying record's parentUuid (the inbound edge)." },
+            "role": { "enum": ["system", "user", "assistant", "tool"] },
+            "is_sidechain": { "type": "boolean" },
+            "block_refs": { "type": "array", "items": { "$ref": "#/$defs/sha" } },
+            "request_id": { "type": ["string", "null"], "description": "Server request id for assistant messages; joins to inference.correlation.server_request_id." },
+            "agent_id": { "type": "string", "description": "v1.4: set when this message came from a sub-agent transcript (<sid>/subagents/agent-<agent_id>.jsonl). The matching subagent_meta harness_event carries the spawn linkage (toolUseId)." },
+            "workflow_id": { "type": "string", "description": "v1.4: set when the sub-agent ran inside a workflow (<sid>/subagents/workflows/<workflow_id>/)." }
+          }
+        },
+        {
+          "title": "inference",
+          "description": "The atomic unit: one assembled API call (one attempt). Maps to session-fs inferences/NNNN/manifest.json. context is the ordered, reified, annotated ref list -> exactly what the model saw.",
+          "required": ["type", "index", "model", "context"],
+          "properties": {
+            "type": { "const": "inference" },
+            "index": { "type": "integer", "minimum": 0 },
+            "attempt": { "type": "integer", "minimum": 0, "description": "0 for the first try; increments per retry (retries are real context variations)." },
+            "agent": { "type": "string", "description": "v1.1 labeling policy: 'main' (the lineage carrying the transcript's main thread), 'background:title'/'background:suggest' (signature-classified per call), else 'lineage-<id>' — upgraded to 'subagent:<name>' when the OTEL api_request events attest exactly ONE agent.name across that lineage. Never a fabricated name: without an OTEL-attested name the placeholder 'lineage-<id>' stands." },
+            "lineage_id": { "type": ["string", "null"], "description": "v1.1: first 12 hex of the prelude hash (content-only system + tools + params). The verified-reliable lineage discriminator; CC's own agent/isSidechain signals under-report. This is the prelude KIND — parallel same-type agent instances share it; use instance_id (v1.5) for instance identity." },
+            "instance_id": { "type": ["string", "null"], "description": "v1.5: chain-component identity — the component root request's client uuid. Distinct per parallel same-type agent instance; stable across a resume boundary (one logical thread keeps one instance_id)." },
+            "parent_index": { "type": ["integer", "null"], "description": "v1.1: the previous inference IN THE SAME LINEAGE (null for a lineage's first) — never a global chain." },
+            "model": { "type": "string" },
+            "ts_source": {
+              "enum": ["otel", "file-mtime", null],
+              "description": "v1.1: where this inference's ts came from — OTEL api_request (reported) or the body file's mtime (derived). Honesty marker for the log ordering, which sorts on ts."
+            },
+            "otel_seq": { "$ref": "#/$defs/otel_seq" },
+            "correlation": { "$ref": "#/$defs/correlation" },
+            "context": { "type": "array", "items": { "$ref": "#/$defs/context_entry" } },
+            "prelude": {
+              "type": ["object", "null"],
+              "description": "v1.1: the per-lineage request prelude — what the conversation context alone is missing. system_refs/tool_refs point into objects; params carries every top-level request key except system/messages/tools/metadata (metadata holds user_id, already session-level, and would splinter prelude hashes).",
+              "additionalProperties": false,
+              "properties": {
+                "system_refs": { "type": "array", "items": { "$ref": "#/$defs/sha" } },
+                "tool_refs": { "type": "array", "items": { "$ref": "#/$defs/sha" } },
+                "params": { "type": "object" }
+              }
+            },
+            "response_block_refs": {
+              "type": "array", "items": { "$ref": "#/$defs/sha" },
+              "description": "v1.1: the response's content blocks as object refs, in order — makes the response reconstructable from the doc alone."
+            },
+            "pairing": {
+              "enum": ["request-id-chain", "message-id-chain", "successor-embedding", "otel-window", "token-affinity", "elimination", null],
+              "description": "v1.1: HOW this request was bound to its response — the exhaustive set of methods the emitter produces, listed in the order the emitter tries them, strongest first. The three chain/content tiers come first because they are the session's own statement of what fed what; the timing-derived window is consulted only for what they left unbound. 'request-id-chain': the successor request's system[0] billing header names the previous call's server request id (cc_prev_req), and those ids ARE response filenames (exact). 'message-id-chain': the successor request's diagnostics.previous_message_id names the previous response's msg_... id (exact). 'successor-embedding': the response's content blocks reappear, content-hashed, in the next message-count level of the same lineage (exact via the object store). 'token-affinity': a lineage TAIL with several candidates, ranked by request byte size against response input-token total (heuristic, flagged). 'elimination': a lineage tail where exactly one request and one response remain in the group (unique candidate). 'otel-window': replaying the OTEL exporter's own api_request_body/api_response_body event.sequence binds request FILE to response FILE globally, with no lineage knowledge, for requests the chain tiers could not bind; the open request is chosen by computed call-start time (OTEL api_request ts - duration_ms vs the request file's mtime) and ONLY when that time picks one uniquely — a timing-less or tied window is declined and falls through to the tail tiers. null: unpaired — no response body was matched, and the inference is emitted response-less rather than dropped."
+            },
+            "usage": { "$ref": "#/$defs/usage" },
+            "cost_usd": { "type": ["number", "null"], "description": "DERIVED from token usage x a list-price table (normalize/pricing.py), NOT read from the API (the response carries no price). Null only when the model is unpriced (non-Claude). Optionally discounted via --discount." },
+            "cost_usd_reported": { "type": ["number", "null"], "description": "Cross-check: the cost Claude Code reported via OTEL (itself a client-side list-price estimate). Null without the OTEL channel. A gap vs cost_usd means a price-table drift between CC and pricing.py." },
+            "duration_ms": { "type": ["integer", "null"], "description": "OTEL-only." },
+            "stop_reason": { "type": ["string", "null"] },
+            "thinking": {
+              "type": "object",
+              "description": "Fact + provenance of reasoning for this inference, never fabricated content.",
+              "properties": {
+                "present": { "type": "boolean" },
+                "persisted": { "enum": ["none", "summary", "raw"] },
+                "signature_present": { "type": "boolean" }
+              }
+            },
+            "request_body_ref": { "type": ["string", "null"], "description": "sha into the audit ring (raw request body), for byte-level reproduction. Null without raw bodies." },
+            "response_body_ref": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "title": "compaction",
+          "description": "A context edit with provenance, never a deletion. Originals stay in objects/ and the log. replaced_refs/replacement_ref are filled when provenance is derivable (diffing consecutive inference contexts); the OTEL compaction event alone yields trigger + pre/post tokens, so they are optional.",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "compaction" },
+            "otel_seq": { "$ref": "#/$defs/otel_seq" },
+            "trigger": { "type": ["string", "null"], "examples": ["auto", "manual"] },
+            "replaced_refs": { "type": "array", "items": { "$ref": "#/$defs/sha" } },
+            "replacement_ref": { "$ref": "#/$defs/sha" },
+            "pre_tokens": { "type": ["integer", "null"] },
+            "post_tokens": { "type": ["integer", "null"] },
+            "success": { "type": ["boolean", "null"] },
+            "duration_ms": { "type": ["integer", "null"] }
+          }
+        },
+        {
+          "title": "tool_decision",
+          "required": ["type", "tool_name", "decision"],
+          "properties": {
+            "type": { "const": "tool_decision" },
+            "otel_seq": { "$ref": "#/$defs/otel_seq" },
+            "tool_name": { "type": "string" },
+            "tool_use_id": { "type": ["string", "null"] },
+            "decision": { "type": "string", "examples": ["accept", "reject"] },
+            "decision_source": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "title": "api_error",
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["api_error", "api_refusal"] },
+            "otel_seq": { "$ref": "#/$defs/otel_seq" },
+            "correlation": { "$ref": "#/$defs/correlation" },
+            "status_code": { "type": ["integer", "null"] },
+            "error": { "type": ["string", "null"] },
+            "attempt": { "type": ["integer", "null"] },
+            "duration_ms": { "type": ["integer", "null"] }
+          }
+        },
+        {
+          "title": "user_prompt",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "user_prompt" },
+            "otel_seq": { "$ref": "#/$defs/otel_seq" },
+            "prompt_id": { "type": ["string", "null"] },
+            "prompt_ref": { "type": ["string", "null"] },
+            "command_name": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "title": "tombstone",
+          "description": "Honest record of redaction (secret/other-principal/hostile content). Keeps the agent epistemically clean: it knows something was removed and why.",
+          "required": ["type", "reason"],
+          "properties": {
+            "type": { "const": "tombstone" },
+            "target_ref": { "type": ["string", "null"] },
+            "reason": { "type": "string" },
+            "category": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "title": "harness_event",
+          "description": "Open-ended passthrough for the harness 'event zoo' (permission_mode, file_history_snapshot, last_prompt, queue_operation, ...). Slots in with zero schema change.",
+          "required": ["type", "subtype"],
+          "properties": {
+            "type": { "const": "harness_event" },
+            "subtype": { "type": "string" },
+            "otel_seq": { "$ref": "#/$defs/otel_seq" },
+            "uuid": { "type": ["string", "null"], "description": "Preserved so the conversation DAG stays walkable through bookkeeping records." },
+            "parent_uuid": { "type": ["string", "null"] },
+            "agent_id": { "type": "string", "description": "v1.4: set when this bookkeeping record came from a sub-agent transcript (<sid>/subagents/agent-<agent_id>.jsonl) — the same tag the sibling message events carry. The subagent_meta / workflow_meta / workflow_journal records instead carry their ids inside `data`." },
+            "workflow_id": { "type": "string", "description": "v1.4: set alongside agent_id when the sub-agent ran inside a workflow (<sid>/subagents/workflows/<workflow_id>/)." },
+            "data": { "type": "object", "description": "Optional; content deliberately NOT inlined for sensitive record types (e.g. attachments)." }
+          }
+        },
+        {
+          "title": "hook",
+          "description": "v1.3: one Claude Code hook firing, recorded VERBATIM by the injected passive listener (the hook channel). subtype = the CC hook event name (SessionStart, PreToolUse, PreCompact, ...); payload = the stdin JSON blob exactly as delivered; ts = when the recorder received it.",
+          "required": ["type", "subtype", "payload"],
+          "properties": {
+            "type": { "const": "hook" },
+            "subtype": { "type": ["string", "null"], "description": "payload.hook_event_name; null when the payload did not parse (payload.raw holds the bytes)." },
+            "payload": { "type": "object" }
+          }
+        },
+        {
+          "title": "unknown-event",
+          "description": "v1.1 catch-all: makes the type set GENUINELY open (the v1 oneOf rejected any new event type, contradicting the 'only event types get added' promise). Any type not claimed by a branch above validates as the bare event shape; consumers must tolerate unknown types.",
+          "properties": {
+            "type": {
+              "not": {
+                "enum": ["message", "inference", "compaction", "tool_decision", "api_error", "api_refusal", "user_prompt", "tombstone", "harness_event", "hook"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
