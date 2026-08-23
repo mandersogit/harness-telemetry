@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# captures — explore Claude Code OTEL body captures written by ./claude-capture.
+# All output on stdout; diagnostics on stderr; never writes files.
+#
+# Data model: a capture session is a timestamped dir under the capture root
+# (default $PWD/captures — the current directory, same as the Python
+# launcher — or $CLAUDE_CAPTURE_DIR to override). Each session holds bodies/ with
+# <uuid>.request.json + <req-id>.response.json files — one pair per inference.
+# This explorer pairs a request with its response by write order (mtime) — an
+# APPROXIMATION kept for zero-dependency eyeballing. The bodies actually chain
+# exactly (cc_prev_req / diagnostics.previous_message_id, CC >= 2.1.198), and
+# `harness-normalize` uses those chains: for real numbers, pairing, lineages,
+# and cost, trust `harness-normalize <capture> --check`, not this script.
+# Concurrent sub-agent requests DO interleave here (known, accepted).
+#
+# Usage: captures <command> [args]
+#   <sess> = timestamp or substring of a session dir, or '.' for the newest.
+#   [i]    = 1-based inference index within a session (default 1).
+#
+# Commands:
+#   ls                        table of sessions: ts, #inf, #bg, primary model, version, tokens, argv
+#   stats                     corpus totals: sessions, inferences, tokens, est cost
+#   env <sess>                the session's capture-env.txt (resolved capture config)
+#   show <sess>               per-inference table: kind, model, sizes, tokens, stop, prompt
+#   system <sess> [i]         full system prompt (all blocks joined) of inference i
+#   prompt <sess> [i]         the human prompt text of inference i
+#   reply <sess> [i]          the model's reply text of inference i
+#   tools <sess> [i] [name]   tool names of inference i; with name, that tool's schema
+#   messages <sess>           the conversation only (deduped, housekeeping removed)
+#   calls <sess> [i|i-j]      raw per-inference messages: all, one, or a slice — labeled by kind
+#   usage <sess> [i]          token/cache usage for inference i, or all inferences if omitted
+#   grep <regex> [sess]       search request+response text; default across all sessions
+#   raw <sess> <i> req|res    print a raw body file (pipe to jq for ad-hoc queries)
+#
+# Portability: targets stock macOS (bash 3.2) and BSD userland as well as Linux —
+# no `mapfile`/`readarray`, no GNU-only coreutils flags. Keep it that way.
+set -euo pipefail
+
+command -v jq >/dev/null 2>&1 || { echo "captures needs jq" >&2; exit 127; }
+
+# Root defaults to $PWD/captures (matching the Python launcher's
+# os.getcwd()/captures), not the repo the script happens to live in — a user
+# running `captures` from their own project dir gets that dir's captures/.
+ROOT="${CLAUDE_CAPTURE_DIR:-$PWD/captures}"
+
+usage() { sed -n '2,33p' "$0" >&2; exit 1; }
+die()   { echo "error: $*" >&2; exit 1; }
+tab()   { if command -v column >/dev/null 2>&1; then column -t -s "$(printf '\t')"; else cat; fi; }
+
+# Cost estimate rates, USD per million tokens (Claude Opus 4.8 list pricing,
+# refreshed 2026-07-02; cache-create priced at the 5m-write rate). A single-model
+# EYEBALL estimate only — harness-normalize derives real per-model cost.
+R_IN=5; R_OUT=25; R_CR=0.5; R_CC=6.25
+
+# Sessions oldest→newest (timestamp dir names sort chronologically).
+sessions() { command ls -d -- "$ROOT"/*/ 2>/dev/null | sort; }
+
+# Resolve a session selector to one dir (trailing slash). '.'/empty = newest.
+resolve() {
+  local sel="${1:-}" d last=""
+  if [ -z "$sel" ] || [ "$sel" = "." ]; then
+    last=$(sessions | tail -1)
+    [ -n "$last" ] || die "no capture sessions under $ROOT"
+    printf '%s\n' "$last"; return
+  fi
+  while IFS= read -r d; do
+    case "${d%/}" in *"$sel"*) last="$d";; esac
+  done < <(sessions)
+  [ -n "$last" ] || die "no capture session matches '$sel' under $ROOT"
+  printf '%s\n' "$last"
+}
+
+# Body files for a session dir ($1 ends in /), oldest→newest by write time.
+reqfiles() { command ls -tr -- "$1"bodies/*.request.json  2>/dev/null || true; }
+resfiles() { command ls -tr -- "$1"bodies/*.response.json 2>/dev/null || true; }
+
+# The i-th (1-based) request/response file of a session, or empty.
+nthreq() { reqfiles "$1" | sed -n "${2}p"; }
+nthres() { resfiles "$1" | sed -n "${2}p"; }
+
+# Sum a .usage.<field> across all of a session's responses.
+sum_usage() {
+  local line files=()
+  while IFS= read -r line; do files+=("$line"); done < <(resfiles "$1")
+  [ ${#files[@]} -gt 0 ] || { echo 0; return; }
+  jq -s --arg f "$2" '[.[].usage[$f] // 0] | add // 0' "${files[@]}"
+}
+
+# jq: render a message .content value (string, or array of typed blocks) to text.
+TXT='def txt: if type=="string" then . else [ .[] |
+    if   .type=="text"        then .text
+    elif .type=="thinking"    then "[thinking] " + (.thinking // "")
+    elif .type=="tool_use"    then "[tool_use:\(.name)] " + (.input|tojson)
+    elif .type=="tool_result" then "[tool_result] " + (.content
+         | if type=="string" then . else ([.[]?|.text? // tojson]|join("\n")) end)
+    elif .type=="image"       then "[image]"
+    else "[\(.type // "block")]" end ] | join("\n") end;'
+# jq: the human prompt = last text block of the last user message.
+PROMPT="$TXT"' [.messages[]|select(.role=="user")] | last | .content
+    | (if type=="string" then . else ([.[]|select(.type=="text").text]|last) end) // ""'
+# jq: classify a request as a housekeeping/background call vs the main agent turn.
+# Interactive (cli) sessions emit extra calls the conversation model didn't drive:
+# title generation (Haiku) and next-prompt "SUGGESTION MODE". Signature-based, so
+# may need new signatures as the harness adds background call types.
+CLASSIFY='
+    ([.system[].text] | join(" ")) as $sys
+  | ([.messages[]? | select(.role=="user")] | last | .content
+       | if type=="string" then . else ([.[]? | select(.type=="text") | .text] | last) end) as $u
+  | if   ($sys | test("sentence-case title"))            then "title"
+    elif (($u // "") | test("^\\s*\\[SUGGESTION MODE"))  then "suggest"
+    else "main" end'
+
+# 1-based index of the LAST main (non-housekeeping) inference, or the last
+# inference overall if every call is housekeeping. Because each request carries
+# the full accumulated history, this inference's messages + its response are the
+# complete conversation transcript.
+last_main_idx() {
+  local i=0 last=0 total=0 f
+  while IFS= read -r f; do
+    i=$((i+1)); total=$i
+    [ "$(jq -r "$CLASSIFY" "$f" 2>/dev/null)" = main ] && last=$i
+  done < <(reqfiles "$1")
+  if [ "$last" -gt 0 ]; then echo "$last"; else echo "$total"; fi
+}
+
+# Render one inference's request messages (+ its response) to stdout. With
+# header=1, prefix a banner with the index, kind, and model. Shared by the
+# `messages` (single-inference) and `calls` (all-inferences) commands.
+render_inf() {
+  local dir="$1" idx="$2" header="${3:-0}" rq rs kind model
+  rq=$(nthreq "$dir" "$idx"); [ -n "$rq" ] || die "no inference $idx in $(basename "$dir")"
+  rs=$(nthres "$dir" "$idx")
+  if [ "$header" = 1 ]; then
+    kind=$(jq -r "$CLASSIFY" "$rq" 2>/dev/null)
+    model=$(jq -r '.model // "?"' "$rq")
+    printf '\n══════ inference %s · %s · %s ══════\n\n' "$idx" "$kind" "$model"
+  fi
+  jq -r "$TXT"' .messages[] | "### \(.role)\n\n\(.content|txt)\n"' "$rq"
+  if [ -n "$rs" ]; then
+    jq -r "$TXT"' "### assistant · response\n\n" + (.content|txt) + "\n"' "$rs"
+  fi
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1; shift
+
+case "$cmd" in
+  ls)
+    { printf 'SESSION\tINF\tBG\tMODEL\tVERSION\tIN_TOK\tOUT_TOK\tARGV\n'
+      while IFS= read -r d; do
+        R=(); while IFS= read -r line; do R+=("$line"); done < <(reqfiles "$d")
+        total=${#R[@]}; bg=0; model='-'; ver=''
+        for ((j=0; j<total; j++)); do
+          f="${R[$j]}"
+          if [ "$(jq -r "$CLASSIFY" "$f" 2>/dev/null)" = main ]; then
+            if [ "$model" = '-' ]; then
+              model=$(jq -r '.model // "-"' "$f")
+              ver=$(jq -r '.system[0].text // ""' "$f" | sed -n 's/.*cc_version=\([^;]*\).*/\1/p')
+            fi
+          else bg=$((bg+1)); fi
+        done
+        # all-background (or empty) session: fall back to the first request's model
+        if [ "$model" = '-' ] && [ "$total" -gt 0 ]; then
+          model=$(jq -r '.model // "-"' "${R[0]}")
+          ver=$(jq -r '.system[0].text // ""' "${R[0]}" | sed -n 's/.*cc_version=\([^;]*\).*/\1/p')
+        fi
+        # `|| true` guards the pipeline's own status: under `pipefail`, a missing
+        # capture-env.txt (sed exit 2, silenced by 2>/dev/null) would otherwise
+        # propagate through `cut`'s success and kill the whole `ls` under set -e.
+        argv=$( { sed -n 's/^argv_flags=//p; s/^argv=//p' "$d"capture-env.txt 2>/dev/null | head -1 | cut -c1-44; } || true)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$(basename "$d")" "$total" "$bg" "$model" "${ver:- -}" \
+          "$(sum_usage "$d" input_tokens)" "$(sum_usage "$d" output_tokens)" "${argv:- -}"
+      done < <(sessions)
+    } | tab
+    ;;
+
+  stats)
+    ns=0; ni=0; tin=0; tout=0; tcr=0; tcc=0; lines=""
+    while IFS= read -r d; do
+      ns=$((ns+1)); n=$(reqfiles "$d" | wc -l); ni=$((ni+n))
+      i=$(sum_usage "$d" input_tokens);  o=$(sum_usage "$d" output_tokens)
+      cr=$(sum_usage "$d" cache_read_input_tokens); cc=$(sum_usage "$d" cache_creation_input_tokens)
+      tin=$((tin+i)); tout=$((tout+o)); tcr=$((tcr+cr)); tcc=$((tcc+cc))
+      lines+="$((i+o))	$(basename "$d")	${n} inf"$'\n'
+    done < <(sessions)
+    [ $ns -gt 0 ] || die "no capture sessions under $ROOT"
+    first=$(sessions | head -1); last=$(sessions | tail -1)
+    cost=$(awk -v i=$tin -v o=$tout -v cr=$tcr -v cc=$tcc \
+      -v ri=$R_IN -v ro=$R_OUT -v rcr=$R_CR -v rcc=$R_CC \
+      'BEGIN{printf "%.4f",(i*ri+o*ro+cr*rcr+cc*rcc)/1e6}')
+    printf 'sessions      : %s\n' "$ns"
+    printf 'inferences    : %s\n' "$ni"
+    printf 'input tokens  : %s\n' "$tin"
+    printf 'output tokens : %s\n' "$tout"
+    printf 'cache read    : %s\n' "$tcr"
+    printf 'cache create  : %s\n' "$tcc"
+    printf 'est cost      : ~$%s (opus 4.8 rates; eyeball only — trust harness-normalize)\n' "$cost"
+    printf 'date range    : %s .. %s\n' "$(basename "$first")" "$(basename "$last")"
+    printf 'top by tokens :\n'
+    printf '%s' "$lines" | sort -rn | head -5 | sed 's/^/  /' | tab
+    ;;
+
+  env)
+    dir=$(resolve "${1:-}"); cat "$dir"capture-env.txt
+    ;;
+
+  show)
+    dir=$(resolve "${1:-}")
+    R=(); while IFS= read -r line; do R+=("$line"); done < <(reqfiles "$dir")
+    S=(); while IFS= read -r line; do S+=("$line"); done < <(resfiles "$dir")
+    { printf 'IDX\tKIND\tMODEL\tSYS\tMSGS\tTOOLS\tIN\tOUT\tCREAD\tSTOP\tPROMPT\n'
+      i=0
+      while [ $i -lt ${#R[@]} ]; do
+        rq="${R[$i]}"; rs="${S[$i]:-}"
+        kind=$(jq -r "$CLASSIFY" "$rq" 2>/dev/null)
+        IFS=$'\t' read -r model nsys nmsg ntool < <(jq -r \
+          '[.model,(.system|length),(.messages|length),(.tools|length)]|@tsv' "$rq")
+        snip=$(jq -r "$PROMPT" "$rq" 2>/dev/null | tr '\n' ' ' | cut -c1-46)
+        if [ -n "$rs" ]; then
+          IFS=$'\t' read -r in out cr stop < <(jq -r \
+            '[(.usage.input_tokens//0),(.usage.output_tokens//0),(.usage.cache_read_input_tokens//0),(.stop_reason//"-")]|@tsv' "$rs")
+        else in='-'; out='-'; cr='-'; stop='(no resp)'; fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$((i+1))" "$kind" "$model" "$nsys" "$nmsg" "$ntool" "$in" "$out" "$cr" "$stop" "${snip:- -}"
+        i=$((i+1))
+      done
+    } | tab
+    echo "session: $(basename "$dir")  (${#R[@]} inferences)" >&2
+    ;;
+
+  system)
+    dir=$(resolve "${1:-}"); f=$(nthreq "$dir" "${2:-1}")
+    [ -n "$f" ] || die "no inference ${2:-1} in $(basename "$dir")"
+    jq -r '.system[].text' "$f"
+    ;;
+
+  prompt)
+    dir=$(resolve "${1:-}"); f=$(nthreq "$dir" "${2:-1}")
+    [ -n "$f" ] || die "no inference ${2:-1} in $(basename "$dir")"
+    jq -r "$PROMPT" "$f"
+    ;;
+
+  reply)
+    dir=$(resolve "${1:-}"); f=$(nthres "$dir" "${2:-1}")
+    [ -n "$f" ] || die "no response for inference ${2:-1} in $(basename "$dir")"
+    jq -r "$TXT"' .content | txt' "$f"
+    ;;
+
+  tools)
+    dir=$(resolve "${1:-}"); f=$(nthreq "$dir" "${2:-1}")
+    [ -n "$f" ] || die "no inference ${2:-1} in $(basename "$dir")"
+    if [ $# -ge 3 ]; then jq --arg n "$3" '.tools[] | select(.name==$n)' "$f"
+    else jq -r '.tools[].name' "$f"; fi
+    ;;
+
+  messages)
+    dir=$(resolve "${1:-}")
+    [ $# -lt 2 ] || die "messages shows the whole conversation and takes no index; use 'calls' for a specific inference or slice"
+    render_inf "$dir" "$(last_main_idx "$dir")" 0
+    ;;
+
+  calls)
+    dir=$(resolve "${1:-}")
+    R=(); while IFS= read -r line; do R+=("$line"); done < <(reqfiles "$dir")
+    n=${#R[@]}; [ "$n" -gt 0 ] || die "no inferences in $(basename "$dir")"
+    case "${2:-}" in
+      "")   lo=1;        hi=$n ;;
+      *-*)  lo=${2%%-*}; hi=${2##*-} ;;
+      *)    lo=$2;       hi=$2 ;;
+    esac
+    case "$lo" in ''|*[!0-9]*) die "bad range '${2:-}' — use i or i-j";; esac
+    case "$hi" in ''|*[!0-9]*) die "bad range '${2:-}' — use i or i-j";; esac
+    { [ "$lo" -ge 1 ] && [ "$hi" -le "$n" ] && [ "$lo" -le "$hi" ]; } \
+      || die "range $lo-$hi out of bounds (1-$n)"
+    for ((k=lo; k<=hi; k++)); do render_inf "$dir" "$k" 1; done
+    echo "session: $(basename "$dir")  ($n inferences; showed $lo-$hi)" >&2
+    ;;
+
+  usage)
+    dir=$(resolve "${1:-}")
+    if [ $# -ge 2 ]; then
+      f=$(nthres "$dir" "$2"); [ -n "$f" ] || die "no response for inference $2"
+      jq '.usage' "$f"
+    else
+      S=(); while IFS= read -r line; do S+=("$line"); done < <(resfiles "$dir")
+      { printf 'IDX\tIN\tOUT\tCACHE_R\tCACHE_C\n'
+        i=0; while [ $i -lt ${#S[@]} ]; do
+          IFS=$'\t' read -r in out cr cc < <(jq -r \
+            '[(.usage.input_tokens//0),(.usage.output_tokens//0),(.usage.cache_read_input_tokens//0),(.usage.cache_creation_input_tokens//0)]|@tsv' "${S[$i]}")
+          printf '%s\t%s\t%s\t%s\t%s\n' "$((i+1))" "$in" "$out" "$cr" "$cc"; i=$((i+1))
+        done
+      } | tab
+    fi
+    ;;
+
+  grep)
+    [ $# -ge 1 ] || die "grep needs <regex>"
+    rx=$1; shift
+    if [ $# -ge 1 ]; then dirs=$(resolve "$1"); else dirs=$(sessions); fi
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      s=$(basename "$d"); idx=0
+      while IFS= read -r f; do
+        idx=$((idx+1))
+        jq -r --arg rx "$rx" --arg s "$s" --arg i "$idx" "$TXT"'
+          .messages[] | (.content|txt) as $t | select($t|test($rx;"i"))
+          | "\($s) #\($i) [\(.role)] " + (($t|gsub("\\s+";" "))[:120])' "$f" 2>/dev/null || true
+      done < <(reqfiles "$d")
+      idx=0
+      while IFS= read -r f; do
+        idx=$((idx+1))
+        jq -r --arg rx "$rx" --arg s "$s" --arg i "$idx" "$TXT"'
+          (.content|txt) as $t | select($t|test($rx;"i"))
+          | "\($s) #\($i) [reply] " + (($t|gsub("\\s+";" "))[:120])' "$f" 2>/dev/null || true
+      done < <(resfiles "$d")
+    done < <(printf '%s\n' "$dirs")
+    ;;
+
+  raw)
+    dir=$(resolve "${1:-}"); i="${2:?raw needs <sess> <i> req|res}"; which="${3:?raw needs req|res}"
+    case "$which" in
+      req|request)  f=$(nthreq "$dir" "$i");;
+      res|response) f=$(nthres "$dir" "$i");;
+      *) die "third arg must be req or res";;
+    esac
+    [ -n "$f" ] || die "no $which for inference $i in $(basename "$dir")"
+    cat "$f"
+    ;;
+
+  *) echo "error: unknown command '$cmd'" >&2; usage ;;
+esac

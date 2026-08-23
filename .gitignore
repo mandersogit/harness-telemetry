@@ -1,0 +1,28 @@
+# Runtime capture output — sensitive (prompts, file contents, secrets). Never commit.
+captures/
+*.request.json
+*.response.json
+
+# Built normalized output — derived from captures, same sensitivity (objects/ hold block text). Never commit.
+sessions/
+# Root-level outputs of `harness-normalize --out` examples — never commit.
+/normalized.json
+/merged.json
+
+# Python build artifacts + virtualenvs (never commit a venv)
+__pycache__/
+*.pyc
+local.venv/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+
+# public copy: the maintainer's private notes must never land here
+dev-notes/

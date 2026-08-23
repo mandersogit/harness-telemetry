@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# harness-capture — thin shim to the Python launcher (src/harness_telemetry/capture.py).
+# Runs a real `claude` session with full capture; finalizes sessions/<ts>/ on exit.
+# All argv passes to claude verbatim; config is env-only (see the module docstring).
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+entry="$here/local.venv/bin/harness-capture"
+
+[ -x "$entry" ] || { echo "run: PYTHON=python3.11 make install" >&2; exit 1; }
+
+exec "$entry" "$@"

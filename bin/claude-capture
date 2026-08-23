@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# claude-capture — run Claude Code with raw-body session capture enabled. OPT-IN.
+#
+# The MINIMAL capture: a file sink for the untruncated request/response bodies and
+# nothing else of its own. For the full one — an in-process OTLP sink that owns every
+# telemetry destination, the hook channel, and an enriched transcript on exit — use
+# `harness-capture` (the Python launcher) instead.
+#
+# Distinct command on purpose: do NOT put this ahead of `claude` on PATH. With
+# OTEL_LOG_RAW_API_BODIES on, this captures EVERYTHING that passes through context
+# — prompts, file contents, bash commands, secrets — and writes it to disk. Treat
+# the capture dir as sensitive; it is created 0700 and gitignored here.
+#
+# Usage:  claude-capture [claude args...]
+#   CLAUDE_CAPTURE_DIR   override base dir (default: ./captures under the current directory)
+#   OTEL_EXPORTER_OTLP_ENDPOINT
+#       NOT defaulted. Unset, the OTLP exporters are turned OFF (`none`) — this
+#       script has no sink of its own, and defaulting to localhost:4318 would feed
+#       prompts and tool details to whatever agent already listens there. Set it and
+#       telemetry (prompts, tool details) goes to THAT collector, off this box.
+#
+# Verified (2026-06-27): OTEL_LOG_RAW_API_BODIES=file:<dir> writes the
+# *.request.json / *.response.json body files to <dir>/bodies/ WITHOUT a live OTLP
+# collector — the file sink is independent of OTEL_LOGS_EXPORTER reaching one.
+# (Metrics/events DO need a collector; without one they drop silently, no error.)
+set -euo pipefail
+
+# Local time: capture ids are read by the operator and captures stay on this
+# machine. Matches the Python launcher.
+ts="$(date +%Y%m%d-%H%M%S)"
+base="${CLAUDE_CAPTURE_DIR:-$PWD/captures}"
+mkdir -p "$base"
+
+# Claim the timestamped dir EXCLUSIVELY: two captures starting in the same second
+# must not merge into one (mkdir -p would silently share it). The umask lives in a
+# subshell so `claude` and everything it spawns do NOT inherit it.
+dir="$base/$ts"
+n=0
+while :; do
+  if (umask 077; mkdir "$dir") 2>/dev/null; then break; fi
+  n=$((n + 1))
+  if [ "$n" -ge 50 ]; then
+    echo "[claude-capture] cannot create a capture dir under $base" >&2
+    exit 1
+  fi
+  dir="$base/$ts-$((n + 1))"
+done
+(umask 077; mkdir "$dir/bodies")
+
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export OTEL_LOG_RAW_API_BODIES="file:$dir/bodies"   # untruncated request/response bodies → disk
+export OTEL_LOG_USER_PROMPTS=1
+export OTEL_LOG_TOOL_DETAILS=1
+# Unset, Claude Code falls back to OTEL_LOG_USER_PROMPTS. Pinned on — capture
+# every channel at full fidelity — and pinned explicitly so the OTEL scope is
+# stated, not inherited from the fallback.
+export OTEL_LOG_ASSISTANT_RESPONSES="${OTEL_LOG_ASSISTANT_RESPONSES:-1}"
+export OTEL_LOGS_EXPORT_INTERVAL="${OTEL_LOGS_EXPORT_INTERVAL:-2000}"     # flush fast for short runs
+export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}"
+
+# Split an endpoint URL into scheme / netloc, dropping any user:pass@ and any
+# ?query or #fragment — every one of those can carry a credential, and this value
+# is both printed and recorded. The query has to go BEFORE the netloc is taken:
+# "https://collector.example?token=x" has no slash, so without stripping it the
+# token stays inside the netloc. (bash 3.2: plain parameter expansion, no regex.)
+ep_scheme=""; ep_netloc=""
+split_endpoint() {
+  case "$1" in
+    *"://"*) ep_scheme="${1%%://*}"; _rest="${1#*://}" ;;
+    *)       ep_scheme=""; _rest="$1" ;;
+  esac
+  _rest="${_rest%%\?*}"
+  _rest="${_rest%%#*}"
+  case "$_rest" in
+    */*) ep_netloc="${_rest%%/*}" ;;
+    *)   ep_netloc="$_rest" ;;
+  esac
+  ep_netloc="${ep_netloc#*@}"
+}
+
+target=""
+if [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+  export OTEL_LOGS_EXPORTER=none
+  export OTEL_METRICS_EXPORTER=none
+  echo "[claude-capture] no OTEL_EXPORTER_OTLP_ENDPOINT set — OTLP exporters OFF." >&2
+  echo "[claude-capture] capturing RAW BODIES ONLY (file sink) → $dir/bodies" >&2
+  echo "[claude-capture] metrics/events need a collector; for the full capture" >&2
+  echo "[claude-capture] (in-process OTLP sink, hooks, enriched transcript) run:" >&2
+  echo "[claude-capture]     harness-capture [claude args...]" >&2
+else
+  export OTEL_LOGS_EXPORTER="${OTEL_LOGS_EXPORTER:-otlp}"
+  export OTEL_METRICS_EXPORTER="${OTEL_METRICS_EXPORTER:-otlp}"
+  export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
+  split_endpoint "$OTEL_EXPORTER_OTLP_ENDPOINT"
+  # Per-signal destinations override the generic one (official docs) and would
+  # silently route content-flagged telemetry elsewhere: drop them, say so.
+  for sig in LOGS METRICS TRACES; do for kind in ENDPOINT HEADERS PROTOCOL; do
+    v="OTEL_EXPORTER_OTLP_${sig}_${kind}"
+    if eval "[ -n \"\${$v-}\" ]"; then
+      echo "[claude-capture] WARNING: $v was set — ignored; only the generic endpoint is used." >&2
+      unset "$v"
+    fi
+  done; done
+  target="${ep_scheme:+$ep_scheme://}$ep_netloc"          # scheme://host:port only
+  echo "[claude-capture] WARNING: OTEL_EXPORTER_OTLP_ENDPOINT is set." >&2
+  echo "[claude-capture] WARNING: USER PROMPTS and TOOL DETAILS from this session" >&2
+  echo "[claude-capture] WARNING: will be sent to $target — off this machine if that" >&2
+  echo "[claude-capture] WARNING: is not a local collector. Ctrl-C now to stop." >&2
+fi
+
+# Record the resolved capture config alongside the bodies for later correlation.
+# Allow-list only: no header, token or credential variable is ever named here.
+(umask 077; {
+  echo "ts=$ts"
+  # Flag names only — a prompt, a path or a model name is session content, not provenance
+  # (same policy as the Python launcher).
+  flags=""; n=0
+  for a in "$@"; do n=$((n+1)); case "$a" in -?*) flags="$flags ${a%%=*}";; esac; done
+  echo "argv_flags=${flags# }"
+  echo "argv_n=$n"
+  for v in CLAUDE_CODE_ENABLE_TELEMETRY OTEL_LOGS_EXPORTER OTEL_METRICS_EXPORTER \
+           OTEL_EXPORTER_OTLP_ENDPOINT OTEL_LOG_RAW_API_BODIES OTEL_LOG_USER_PROMPTS \
+           OTEL_LOG_TOOL_DETAILS; do
+    eval "val=\${$v-}"
+    if [ "$v" = "OTEL_EXPORTER_OTLP_ENDPOINT" ]; then val="$target"; fi  # host only: no path/query
+    val="${val//$dir/<capture-dir>}"   # never the absolute path: it names a home dir and a username
+    printf '%s=%s\n' "$v" "$val"
+  done
+} > "$dir/capture-env.txt")
+
+echo "[claude-capture] telemetry → $dir" >&2
+exec claude "$@"

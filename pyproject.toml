@@ -1,0 +1,139 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness-telemetry"
+version = "0.1.0"
+description = "Comparative study of how agentic coding harnesses expose their session internals — a capture + normalize pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Matt Anderson" }]
+keywords = ["ai", "agent", "coding-agent", "llm", "claude-code", "telemetry", "otel"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+# Deliberately austere: jsonschema is the ONLY runtime dependency; everything
+# else in the package is stdlib so the tools run with any python3.
+dependencies = [
+  "jsonschema>=4",
+]
+
+[project.scripts]
+harness-normalize = "harness_telemetry.normalize.claude_code:main"
+harness-validate = "harness_telemetry.normalize.validate:main"
+harness-project = "harness_telemetry.normalize.project:main"
+harness-watch = "harness_telemetry.normalize.watch:main"
+harness-otlp-sink = "harness_telemetry.collector.sink:main"
+harness-capture = "harness_telemetry.capture:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.0",
+  "mypy>=1.8",
+  "pyright>=1.1",
+  "ruff>=0.3",
+  "hypothesis>=6.0",
+  "types-jsonschema>=4",
+  # Markdown formatter for `make format-md`. `mdformat-gfm` teaches mdformat
+  # about GitHub-Flavored Markdown; `mdformat-frontmatter` preserves YAML
+  # frontmatter blocks in dated notes under docs/.
+  #
+  # `markdownlint-cli2` is intentionally NOT here — it's a Node tool, installed
+  # via npm (`npm install -g markdownlint-cli2`) and resolved from PATH in the
+  # Makefile, not a Python dependency.
+  "mdformat>=0.7",
+  "mdformat-gfm>=0.4",
+  "mdformat-tables>=1.0",
+  "mdformat-frontmatter>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mandersogit/harness-telemetry"
+Repository = "https://github.com/mandersogit/harness-telemetry"
+Issues = "https://github.com/mandersogit/harness-telemetry/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+harness_telemetry = ["py.typed", "schema/events.schema.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# captures/ and sessions/ hold sensitive session data; never collect from them.
+# (Setting this REPLACES pytest's defaults, so restore ".*"/build/dist too.)
+norecursedirs = [
+  ".*", "build", "dist", "*.egg",
+  "captures", "sessions", "dev-notes", "docs", "local.venv",
+]
+pythonpath = ["."]
+addopts = "-q --tb=short"
+markers = [
+  "fixtures: maintainer-local tests (tests/local/, not distributed) that replay real captures under captures/; each skips when its named capture is absent",
+]
+
+[tool.coverage.run]
+source = ["src/harness_telemetry"]
+branch = true
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+show_missing = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+packages = ["harness_telemetry"]
+mypy_path = "src"
+
+[tool.pyright]
+pythonVersion = "3.11"
+venvPath = "."
+venv = "local.venv"
+typeCheckingMode = "basic"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",      # pycodestyle errors
+  "W",      # pycodestyle warnings
+  "F",      # pyflakes
+  "I",      # isort
+  "B",      # flake8-bugbear
+  "C4",     # flake8-comprehensions
+  "UP",     # pyupgrade
+  "SIM",    # flake8-simplify
+]
+ignore = [
+  "E501",   # line too long (handled by formatter)
+  "SIM108", # ternary operator suggestion
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["harness_telemetry"]
